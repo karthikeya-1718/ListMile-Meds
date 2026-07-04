@@ -61,37 +61,46 @@ export default function Dashboard() {
 
   const backendUrl = "http://localhost:8000";
 
-  // Fetch all initial data
+  // Fetch all initial data — each call is independent so one failure doesn't block the rest
   const fetchData = async () => {
+    // Patients
     try {
-      // Patients
       const patientsRes = await fetch(`${backendUrl}/api/elderly`);
       const patientsData = await patientsRes.json();
       setPatients(patientsData);
+    } catch (err) { console.error("Failed to fetch patients:", err); }
 
-      // Reminders
+    // Reminders
+    try {
       const remindersRes = await fetch(`${backendUrl}/api/reminders`);
       const remindersData = await remindersRes.json();
-      setReminders(remindersData);
+      // Only show reminders from the last 24 hours so old completed ones don't clutter
+      const cutoff = new Date(Date.now() - 24 * 60 * 60 * 1000);
+      const recent = remindersData.filter(r => new Date(r.scheduled_time) >= cutoff);
+      setReminders(recent);
+    } catch (err) { console.error("Failed to fetch reminders:", err); }
 
-      // Summary & Logs
+    // Summary & Logs
+    try {
       const dashRes = await fetch(`${backendUrl}/api/dashboard`);
       const dashData = await dashRes.json();
       setSummary(dashData.summary);
       setRecentLogs(dashData.recent_logs);
+    } catch (err) { console.error("Failed to fetch dashboard:", err); }
 
-      // Simulator Active Calls
+    // Simulator Active Calls
+    try {
       const callsRes = await fetch(`${backendUrl}/api/simulator/calls`);
       const callsData = await callsRes.json();
       setActiveCalls(callsData);
+    } catch (err) { console.error("Failed to fetch simulator calls:", err); }
 
-      // Simulator WhatsApp alerts
+    // Simulator WhatsApp alerts
+    try {
       const whatsappRes = await fetch(`${backendUrl}/api/simulator/whatsapp`);
       const whatsappData = await whatsappRes.json();
       setWhatsappAlerts(whatsappData);
-    } catch (err) {
-      console.error("Failed to fetch dashboard data:", err);
-    }
+    } catch (err) { console.error("Failed to fetch whatsapp alerts:", err); }
   };
 
   useEffect(() => {
@@ -363,7 +372,7 @@ export default function Dashboard() {
                 <tbody className="divide-y divide-white/5 text-sm">
                   {reminders.length === 0 ? (
                     <tr>
-                      <td colSpan="6" className="text-center py-6 text-slate-500">No scheduled reminders found.</td>
+                      <td colSpan="6" className="text-center py-6 text-slate-500">No reminders scheduled in the last 24 hours. Add a medicine above to schedule one.</td>
                     </tr>
                   ) : (
                     reminders.map(r => {
@@ -383,7 +392,7 @@ export default function Dashboard() {
                             <div className="text-xs text-indigo-300">{r.medicine?.dosage}</div>
                           </td>
                           <td className="py-3.5 px-4 text-slate-300">
-                            {new Date(r.scheduled_time).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+                            {new Date(r.scheduled_time).toLocaleString([], { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' })}
                           </td>
                           <td className="py-3.5 px-4 text-slate-300 font-mono">{r.attempt_count}/3</td>
                           <td className="py-3.5 px-4">
