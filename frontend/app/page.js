@@ -59,7 +59,7 @@ export default function Dashboard() {
   const [ocrTargetPatientId, setOcrTargetPatientId] = useState("");
   const [selectedFile, setSelectedFile] = useState(null);
 
-  const backendUrl = "http://localhost:8000";
+  const backendUrl = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
 
   // Fetch all initial data — each call is independent so one failure doesn't block the rest
   const fetchData = async () => {
