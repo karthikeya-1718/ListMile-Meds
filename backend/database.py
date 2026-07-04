@@ -1,9 +1,15 @@
 import datetime
+import os
+from dotenv import load_dotenv
 from sqlalchemy import create_engine, Column, Integer, String, DateTime, ForeignKey, Boolean
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, relationship
 
-DATABASE_URL = "postgresql://postgres.kmsouchccobpipcmwldx:rvce%23_50lpa@aws-1-ap-southeast-2.pooler.supabase.com:5432/postgres"
+# Load dotenv to read DATABASE_URL if present
+load_dotenv()
+
+DEFAULT_DATABASE_URL = "postgresql://postgres.kmsouchccobpipcmwldx:rvce%23_50lpa@aws-1-ap-southeast-2.pooler.supabase.com:5432/postgres"
+DATABASE_URL = os.getenv("DATABASE_URL", DEFAULT_DATABASE_URL)
 
 engine = create_engine(DATABASE_URL, pool_pre_ping=True)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)

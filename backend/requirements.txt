@@ -7,3 +7,4 @@ python-multipart
 twilio
 python-dotenv
 psycopg2-binary
+google-generativeai

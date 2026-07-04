@@ -2,8 +2,9 @@ import datetime
 import random
 import logging
 import os
+import json
 from typing import List, Optional
-from fastapi import FastAPI, Depends, HTTPException, BackgroundTasks, Form
+from fastapi import FastAPI, Depends, HTTPException, BackgroundTasks, Form, File, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
@@ -11,11 +12,17 @@ from apscheduler.schedulers.background import BackgroundScheduler
 from dotenv import load_dotenv
 from twilio.rest import Client
 from twilio.twiml.voice_response import VoiceResponse
+import google.generativeai as genai
 
 from database import SessionLocal, init_db, User, Elderly, Medicine, ReminderJob, CallLog
 
 # Load variables from .env file
 load_dotenv()
+
+# Configure Gemini Generative AI
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+if GEMINI_API_KEY:
+    genai.configure(api_key=GEMINI_API_KEY)
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("LastMileMeds")
@@ -616,25 +623,93 @@ def simulator_call_action(job_id: int, action: str, db: Session = Depends(get_db
 def get_whatsapp_alerts():
     return whatsapp_alerts
 
-# Simulated Prescription OCR & AI Parsing Endpoint
+# Real Prescription OCR & AI Parsing Endpoint using Gemini API
 @app.post("/api/ocr-parser")
-def simulate_ocr_parser():
-    mock_medicines = [
+async def ocr_parser(file: UploadFile = File(...)):
+    """
+    Accepts an uploaded prescription image/PDF and uses Gemini Vision to extract medicines.
+    """
+    if not GEMINI_API_KEY:
+        raise HTTPException(
+            status_code=400,
+            detail="GEMINI_API_KEY is not configured. Please add GEMINI_API_KEY=your_key to your backend/.env file and restart the server."
+        )
+
+    try:
+        # Read the uploaded file
+        contents = await file.read()
+        
+        # Prepare the image structure for Gemini API
+        image_parts = [
+            {
+                "mime_type": file.content_type,
+                "data": contents
+            }
+        ]
+
+        # Define prompt to extract structured JSON data matching our Medicine models
+        prompt = """
+        You are an expert medical assistant. Carefully analyze the uploaded prescription image or document.
+        Your goal is to extract the list of medications with 100% accuracy, avoiding any discrepancies.
+
+        CRITICAL INSTRUCTIONS:
+        1. **Handwriting Analysis**: Carefully read the doctor's handwriting. If any medication name is ambiguous, cross-reference it with standard medical/drug databases to identify the correct spelling. If it remains completely illegible, prepend '[UNCLEAR]' to the name.
+        2. **Timing & Multiple Doses**: 
+           - Look for dosage frequencies like BD (twice daily), TDS (three times daily), QDS (four times daily), AM/PM, or morning/noon/night.
+           - For medications taken multiple times a day, you MUST create a separate entry/object for each scheduled dose time.
+           - Map them to specific 24-hour time format (HH:MM). Use reasonable defaults:
+             * Morning / Breakfast / AM: "08:00"
+             * Afternoon / Lunch / Noon: "13:00"
+             * Evening / Tea: "17:00"
+             * Night / Dinner / Bedtime / PM: "21:00"
+           - For example, if a medicine is prescribed "twice daily", create one entry for "08:00" and another entry for "21:00".
+        3. **Dosage & Duration**: Extract exactly what the doctor prescribed (e.g., "500mg (1 tablet)", "10ml", "1 drop"). Parse the duration (e.g., "7 Days", "1 Month", "30 Days"). If duration is not specified, default to "30 Days".
+        4. **Elderly-Friendly Description**: Provide a very short description focusing ONLY on shape, size, colour, and smell (if applicable) to help the elderly patient identify it. Keep it extremely brief (e.g., "Small round white pill", "Large red capsule", "Pink liquid syrup"). Do not include long instructions or general tips like "take after food".
+
+        Each medication in the list must have the following fields:
+        - name: The name of the medicine (e.g. "Metformin")
+        - dosage: The dosage strength and quantity (e.g. "500mg (1 tablet)" or "1 pill")
+        - frequency: How often to take it (e.g. "Daily", "Twice daily", "Three times a day")
+        - time: The specific time to take it in 24-hour HH:MM format (e.g. "08:00").
+        - duration: The duration of the course (e.g. "30 Days").
+        - description: Very short description of shape, size, colour, and smell only.
+
+        Return ONLY a JSON object with a single top-level key "medicines", which points to an array of medication objects. Do not include markdown code block formatting or anything else.
+        Example output format:
         {
-            "name": "Metformin",
-            "dosage": "500mg (1 tablet)",
-            "frequency": "Twice daily",
-            "time": "08:00",
-            "duration": "90 Days",
-            "description": "Oval pink tablet with a score line in the middle"
-        },
-        {
-            "name": "Amlodipine",
-            "dosage": "5mg (1 tablet)",
-            "frequency": "Once daily",
-            "time": "20:00",
-            "duration": "30 Days",
-            "description": "Small white round tablet with 'A5' printed on it"
+          "medicines": [
+            {
+              "name": "Metformin",
+              "dosage": "500mg (1 tablet)",
+              "frequency": "Twice daily",
+              "time": "08:00",
+              "duration": "90 Days",
+              "description": "Small pink oval tablet"
+            }
+          ]
         }
-    ]
-    return {"medicines": mock_medicines}
+        """
+
+        model = genai.GenerativeModel('gemini-2.5-flash')
+        response = model.generate_content(
+            [prompt, image_parts[0]],
+            generation_config={"response_mime_type": "application/json"}
+        )
+        
+        text = response.text.strip()
+        result = json.loads(text)
+        return result
+
+    except json.JSONDecodeError as e:
+        logger.error(f"Failed to parse JSON from Gemini response: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail="Failed to parse prescription. The model output was not valid JSON."
+        )
+    except Exception as e:
+        logger.error(f"Error during Gemini OCR prescription parsing: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error parsing prescription: {str(e)}"
+        )
+

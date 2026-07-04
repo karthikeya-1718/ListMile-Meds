@@ -57,6 +57,7 @@ export default function Dashboard() {
   const [ocrLoading, setOcrLoading] = useState(false);
   const [ocrResult, setOcrResult] = useState(null);
   const [ocrTargetPatientId, setOcrTargetPatientId] = useState("");
+  const [selectedFile, setSelectedFile] = useState(null);
 
   const backendUrl = "http://localhost:8000";
 
@@ -157,41 +158,62 @@ export default function Dashboard() {
     }
   };
 
-  // OCR Upload simulation
-  const handleSimulateOCR = () => {
-    setOcrLoading(true);
-    setTimeout(async () => {
-      try {
-        const res = await fetch(`${backendUrl}/api/ocr-parser`, { method: "POST" });
-        const data = await res.json();
-        setOcrResult(data.medicines);
-      } catch (err) {
-        console.error(err);
-      } finally {
-        setOcrLoading(false);
-      }
-    }, 1500);
-  };
-
-  const handleSaveOcrMedicine = async (medData) => {
-    if (!ocrTargetPatientId) {
-      alert("Please select an elderly patient to assign the parsed medication to.");
+  // Real OCR Upload handler
+  const handleRealOCRUpload = async (e) => {
+    e.preventDefault();
+    if (!selectedFile) {
+      alert("Please select a prescription image/PDF file to upload first.");
       return;
     }
+    setOcrLoading(true);
+    setOcrResult(null);
+
+    const formData = new FormData();
+    formData.append("file", selectedFile);
+
     try {
-      const res = await fetch(`${backendUrl}/api/elderly/${ocrTargetPatientId}/medicines`, {
+      const res = await fetch(`${backendUrl}/api/ocr-parser`, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(medData)
+        body: formData,
       });
-      if (res.ok) {
-        alert(`Medication '${medData.name}' saved and scheduled successfully!`);
-        // Remove from list
-        setOcrResult(prev => prev.filter(m => m.name !== medData.name));
-        fetchData();
+
+      if (!res.ok) {
+        const errorData = await res.json();
+        throw new Error(errorData.detail || "Failed to parse the prescription.");
       }
+
+      const data = await res.json();
+      setOcrResult(data.medicines || []);
     } catch (err) {
-      console.error(err);
+      console.error("OCR upload error:", err);
+      alert(err.message || "An error occurred while uploading/parsing the prescription.");
+    } finally {
+      setOcrLoading(false);
+    }
+  };
+
+  const handleFillOcrMedicine = (medData, idx) => {
+    if (!ocrTargetPatientId) {
+      alert("Please select a target patient profile in the OCR panel first.");
+      return;
+    }
+    setNewMedicine({
+      elderly_id: ocrTargetPatientId,
+      name: medData.name || "",
+      dosage: medData.dosage || "1 pill",
+      frequency: medData.frequency || "Daily",
+      time: medData.time || "08:00",
+      duration: medData.duration || "30 Days",
+      description: medData.description || ""
+    });
+
+    // Remove the specific imported medicine from the parsed results using its index
+    setOcrResult(prev => prev.filter((_, i) => i !== idx));
+
+    // Scroll to the Schedule Medication form smoothly
+    const formElement = document.getElementById("schedule-medication-form");
+    if (formElement) {
+      formElement.scrollIntoView({ behavior: "smooth" });
     }
   };
 
@@ -466,7 +488,7 @@ export default function Dashboard() {
             </div>
 
             {/* Add Medication Card */}
-            <div className="glass-panel p-6">
+            <div id="schedule-medication-form" className="glass-panel p-6">
               <h3 className="text-lg font-bold flex items-center gap-2 mb-4 text-white">
                 <Calendar className="w-5 h-5 text-indigo-400" /> Schedule Medication
               </h3>
@@ -560,26 +582,55 @@ export default function Dashboard() {
             </p>
             
             <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
-              <div className="border border-dashed border-white/10 rounded-xl p-6 flex flex-col items-center justify-center text-center bg-white/5">
+              <div className="border border-dashed border-white/10 rounded-xl p-6 flex flex-col items-center justify-center text-center bg-white/5 relative">
+                <input 
+                  type="file" 
+                  id="prescription-upload" 
+                  accept="image/*,application/pdf" 
+                  className="hidden" 
+                  onChange={(e) => setSelectedFile(e.target.files[0] || null)} 
+                />
                 <Upload className="w-10 h-10 text-indigo-400 mb-2" />
-                <span className="text-sm font-semibold text-slate-200">Upload prescription file</span>
-                <span className="text-xs text-slate-500 mt-1">PNG, JPG, PDF (Up to 5MB)</span>
-                
-                <button 
-                  onClick={handleSimulateOCR}
-                  disabled={ocrLoading}
-                  className="mt-4 px-4 py-2 bg-indigo-600/30 border border-indigo-500/40 text-indigo-300 hover:bg-indigo-600/40 rounded-lg text-xs font-semibold transition-all flex items-center gap-2"
-                >
-                  {ocrLoading ? (
-                    <>
-                      <RefreshCw className="w-3.5 h-3.5 animate-spin" /> Scanning & Parsing...
-                    </>
-                  ) : (
-                    <>
-                      <Sparkles className="w-3.5 h-3.5" /> Simulate OCR Upload
-                    </>
-                  )}
-                </button>
+                {selectedFile ? (
+                  <div className="space-y-2 w-full">
+                    <span className="text-sm font-semibold text-emerald-400 block truncate">
+                      📄 {selectedFile.name}
+                    </span>
+                    <span className="text-xs text-slate-400 block">
+                      ({(selectedFile.size / 1024).toFixed(1)} KB)
+                    </span>
+                    <div className="flex gap-2 justify-center mt-2">
+                      <label 
+                        htmlFor="prescription-upload" 
+                        className="cursor-pointer px-3 py-1.5 bg-white/5 border border-white/10 hover:bg-white/10 text-slate-300 rounded-lg text-xs font-semibold transition-all"
+                      >
+                        Change File
+                      </label>
+                      <button 
+                        onClick={handleRealOCRUpload}
+                        disabled={ocrLoading}
+                        className="px-3 py-1.5 bg-indigo-600 hover:bg-indigo-700 text-white rounded-lg text-xs font-semibold transition-all flex items-center gap-1"
+                      >
+                        {ocrLoading ? (
+                          <><RefreshCw className="w-3 h-3 animate-spin" /> Parsing...</>
+                        ) : (
+                          <><Sparkles className="w-3 h-3" /> Parse File</>
+                        )}
+                      </button>
+                    </div>
+                  </div>
+                ) : (
+                  <>
+                    <span className="text-sm font-semibold text-slate-200">Upload prescription file</span>
+                    <span className="text-xs text-slate-500 mt-1 mb-3">PNG, JPG, PDF (Up to 5MB)</span>
+                    <label 
+                      htmlFor="prescription-upload" 
+                      className="cursor-pointer px-4 py-2 bg-indigo-600/30 border border-indigo-500/40 text-indigo-300 hover:bg-indigo-600/40 rounded-lg text-xs font-semibold transition-all flex items-center gap-2"
+                    >
+                      <Plus className="w-3.5 h-3.5" /> Select File
+                    </label>
+                  </>
+                )}
               </div>
 
               <div className="space-y-4">
@@ -608,10 +659,10 @@ export default function Dashboard() {
                           <div className="flex justify-between items-center">
                             <span className="font-bold text-white text-sm">{m.name}</span>
                             <button 
-                              onClick={() => handleSaveOcrMedicine(m)}
-                              className="px-2 py-0.5 bg-emerald-500/20 text-emerald-400 border border-emerald-500/30 hover:bg-emerald-500/30 transition-all rounded font-bold"
+                              onClick={() => handleFillOcrMedicine(m, idx)}
+                              className="px-2.5 py-1 bg-indigo-500/20 text-indigo-300 border border-indigo-500/30 hover:bg-indigo-500/40 transition-all rounded text-[11px] font-bold"
                             >
-                              Add
+                              Fill Form
                             </button>
                           </div>
                           <div><span className="text-slate-400">Dosage:</span> <span className="text-slate-200">{m.dosage}</span></div>
