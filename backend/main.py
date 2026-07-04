@@ -42,7 +42,7 @@ app.add_middleware(
 )
 
 # Base URL to reach this FastAPI server (needed for Twilio Webhook callbacks)
-BASE_URL = os.getenv("SERVER_URL", os.getenv("BASE_URL", "http://localhost:8000"))
+BASE_URL = os.getenv("BASE_URL", os.getenv("SERVER_URL", "http://localhost:8000"))
 
 # Initialise APScheduler with all recurring jobs via scheduler_service
 scheduler = init_scheduler()

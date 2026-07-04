@@ -1,0 +1,33 @@
+[33mcommit 9dbd66153c1ed5ba6519004656be7748aed597b6[m[33m ([m[1;36mHEAD[m[33m -> [m[1;32mmain[m[33m, [m[1;31morigin/main[m[33m, [m[1;31morigin/HEAD[m[33m)[m
+Author: karthikeya-1718 <karthikeyatr1718@gmail.com>
+Commit: karthikeya-1718 <karthikeyatr1718@gmail.com>
+
+    fix: add missing DB migrations and make fetchData resilient
+
+[33mcommit f982776e5d076e1da47fb94d5c29d6867498c994[m
+Author: fantomv21 <varunurs21@gmail.com>
+Commit: fantomv21 <varunurs21@gmail.com>
+
+    feat: add modular caregiver notification system
+    
+    - Refactor monolithic main.py into 5 service modules
+    - Add services/twilio_service.py: thin Twilio REST wrapper
+    - Add services/caregiver_notification_service.py: 7 WhatsApp notification cases + daily/weekly summaries
+    - Add services/call_service.py: outbound call orchestration + full retry state machine
+    - Add services/reminder_service.py: per-minute scheduler tick functions
+    - Add services/scheduler_service.py: APScheduler singleton with 4 registered jobs
+    - Update database.py: add CallStatus enum + 6 new columns (medicine_cue, call_sid, last_call_status, confirmation_status, confirmation_timestamp, caregiver_notified)
+    - Update main.py: delegate to service layer, add /api/notifications/daily-summary and /api/notifications/weekly-summary endpoints
+    - Support BUSY simulator action in /api/simulator/calls/{id}/action
+
+[33mcommit f399c84fa6d6cd549237ae46b61d8e9e4b79e2e6[m
+Author: NishchayKN <nishchaykn@NISHCHAYs-MacBook-Air.local>
+Commit: NishchayKN <nishchaykn@NISHCHAYs-MacBook-Air.local>
+
+    Fix OCR extraction indexing and update medicine description prompt
+
+[33mcommit 1e462a792d68a904b8626bcce1ecb2c1c3dda5ff[m
+Author: karthikeya-1718 <karthikeyatr1718@gmail.com>
+Commit: karthikeya-1718 <karthikeyatr1718@gmail.com>
+
+    Initialize project with frontend, backend, Twilio integration and languages

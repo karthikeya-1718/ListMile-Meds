@@ -159,7 +159,7 @@ def trigger_outbound_call(job_id: int) -> None:
         })
 
         # Place real Twilio call
-        base_url = os.getenv("SERVER_URL", os.getenv("BASE_URL", "http://localhost:8000"))
+        base_url = os.getenv("BASE_URL", os.getenv("SERVER_URL", "http://localhost:8000"))
         twiml_url = f"{base_url}/api/twilio/voice-twiml/{job.id}"
         status_cb = f"{base_url}/api/twilio/status-callback/{job.id}"
 
