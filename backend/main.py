@@ -1,20 +1,22 @@
 import datetime
-import random
 import logging
 import os
 import json
 from typing import List, Optional
-from fastapi import FastAPI, Depends, HTTPException, BackgroundTasks, Form, File, UploadFile
+
+from fastapi import FastAPI, Depends, HTTPException, Form, File, UploadFile, Response
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
-from apscheduler.schedulers.background import BackgroundScheduler
 from dotenv import load_dotenv
-from twilio.rest import Client
 from twilio.twiml.voice_response import VoiceResponse
 import google.generativeai as genai
 
-from database import SessionLocal, init_db, User, Elderly, Medicine, ReminderJob, CallLog
+from database import SessionLocal, init_db, User, Elderly, Medicine, ReminderJob, CallLog, CallStatus
+from services import call_service, caregiver_notification_service as notifier
+from services.call_service import active_calls, get_language_script
+from services.caregiver_notification_service import whatsapp_alerts
+from services.scheduler_service import init_scheduler
 
 # Load variables from .env file
 load_dotenv()
@@ -39,25 +41,11 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Twilio Client Initialization
-TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID")
-TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
-TWILIO_PHONE_NUMBER = os.getenv("TWILIO_PHONE_NUMBER")
-
 # Base URL to reach this FastAPI server (needed for Twilio Webhook callbacks)
-# In development, you will run ngrok or use local machine URL.
 BASE_URL = os.getenv("SERVER_URL", os.getenv("BASE_URL", "http://localhost:8000"))
 
-twilio_client = None
-if TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN:
-    try:
-        twilio_client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
-        logger.info("Twilio client initialized successfully.")
-    except Exception as e:
-        logger.error(f"Failed to initialize Twilio client: {e}")
-
-scheduler = BackgroundScheduler()
-scheduler.start()
+# Initialise APScheduler with all recurring jobs via scheduler_service
+scheduler = init_scheduler()
 
 def get_db():
     db = SessionLocal()
@@ -74,6 +62,7 @@ class MedicineBase(BaseModel):
     time: str
     duration: str
     description: str
+    medicine_cue: Optional[str] = None  # caregiver recognition cue for notifications
 
 class MedicineCreate(MedicineBase):
     pass
@@ -128,13 +117,12 @@ class ReminderJobResponse(BaseModel):
     class Config:
         from_attributes = True
 
-# Escalated Alert Queue for UI Notification Panel
-whatsapp_alerts = []
+# ─────────────────────────────────────────────────────────────────────────────
+# Twilio Voice Webhook Callbacks
+# ─────────────────────────────────────────────────────────────────────────────
 
-# Active Calls Queue for Dial Pad Simulator Panel
-active_calls = []
-
-def trigger_outbound_call(job_id: int):
+@app.post("/api/twilio/voice-twiml/{job_id}")
+def get_voice_twiml(job_id: int, db: Session = Depends(get_db)):
     """
     Triggers a real Twilio Voice Call if client is configured.
     Falls back to Simulation if keys are missing.
@@ -316,157 +304,105 @@ def get_voice_twiml(job_id: int, db: Session = Depends(get_db)):
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
 
+    # Mark job as WAITING_CONFIRMATION (call was answered)
+    job.status = CallStatus.WAITING_CONFIRMATION
+    job.last_call_status = CallStatus.ANSWERED
+    job.last_attempt_time = datetime.datetime.utcnow()
+    db.commit()
+
+    lang_info = get_language_script(job.elderly.language)
+    prompt = lang_info["prompt_tpl"].format(
+        name=job.medicine.name,
+        dosage=job.medicine.dosage,
+        description=job.medicine.description,
+    )
+
     response = VoiceResponse()
 
-    # Determine speech details based on language config
-    language_greetings = {
-        "English": {
-            "greeting": "Hello, this is LastMile Meds calling.",
-            "prompt": f"It is time to take your medicine, {job.medicine.name}. Please take {job.medicine.dosage}. It is a {job.medicine.description}.",
-            "action": "Please press 1 on your telephone keypad to confirm you have taken your medicine.",
-            "voice": "Polly.Amy",
-            "language": "en-GB"
-        },
-        "Hindi": {
-            "greeting": "नमस्ते, यह लास्टमाइल मेड्स की कॉल है।",
-            "prompt": f"आपकी दवाई {job.medicine.name} लेने का समय हो गया है। कृपया {job.medicine.dosage} लें। यह {job.medicine.description} है।",
-            "action": "दवाई लेने की पुष्टि करने के लिए कृपया अपने फोन पर 1 दबाएं।",
-            "voice": "Polly.Aditi",
-            "language": "hi-IN"
-        },
-        "Kannada": {
-            "greeting": "ನಮಸ್ತೆ, ಇದು ಲಾಸ್ಟ್‌ಮೈಲ್ ಮೆಡ್ಸ್ ಕರೆ.",
-            "prompt": f"ನಿಮ್ಮ ಔಷಧ {job.medicine.name} ತೆಗೆದುಕೊಳ್ಳುವ ಸಮಯವಾಗಿದೆ. ದಯವಿಟ್ಟು {job.medicine.dosage} ತಗೊಳ್ಳಿ. ಇದು {job.medicine.description}.",
-            "action": f"ಔಷಧ ತೆಗೆದುಕೊಂಡಿದ್ದೀರಿ ಎಂದು ಖಚಿತಪಡಿಸಲು ದಯವಿಟ್ಟು ಫೋನ್‌ನಲ್ಲಿ 1 ಒತ್ತಿರಿ.",
-            "voice": "Google.kn-IN-Standard-A",
-            "language": "kn-IN"
-        },
-        "Telugu": {
-            "greeting": "నమస్కారం, ఇది లాస్ట్‌మైల్ మెడ్స్ కాల్.",
-            "prompt": f"మీ మందు {job.medicine.name} తీసుకునే సమయం ఆసన్నమైంది. దయచేసి {job.medicine.dosage} తీసుకోండి. ఇది {job.medicine.description}.",
-            "action": "మందు తీసుకున్నట్లు నిర్ధారించడానికి దయచేసి మీ ఫోన్‌లో 1 నొక్కండి.",
-            "voice": "Google.te-IN-Standard-A",
-            "language": "te-IN"
-        },
-        "Tamil": {
-            "greeting": "வணக்கம், இது லாஸ்ட்மைல் மெட்ஸ் அழைப்பு.",
-            "prompt": f"உங்கள் மருந்து {job.medicine.name} எடுத்துக்கொள்ள வேண்டிய நேரம் இது. தயவுசெய்து {job.medicine.dosage} எடுத்துக் கொள்ளுங்கள். இது {job.medicine.description}.",
-            "action": "மருந்து எடுத்துக்கொண்டதை உறுதிப்படுத்த உங்கள் தொலைபேசியில் 1 ஐ அழுத்தவும்.",
-            "voice": "Google.ta-IN-Standard-A",
-            "language": "ta-IN"
-        },
-        "Marathi": {
-            "greeting": "नमस्कार, हा लास्टमाईल मेड्सचा कॉल आहे.",
-            "prompt": f"तुमचे {job.medicine.name} औषध घेण्याची वेळ झाली आहे. कृपया {job.medicine.dosage} घ्या. हे {job.medicine.description} आहे.",
-            "action": "औषध घेतल्याची पुष्टी करण्यासाठी कृपया तुमच्या फोनवर 1 दाबा.",
-            "voice": "Google.mr-IN-Standard-A",
-            "language": "mr-IN"
-        },
-        "Bengali": {
-            "greeting": "নমস্কার, এটি লাস্টমাইল মেডস-এর কল।",
-            "prompt": f"আপনার ওষুধ {job.medicine.name} নেওয়ার সময় হয়েছে। অনুগ্রহ করে {job.medicine.dosage} নিন। এটি {job.medicine.description}।",
-            "action": "ওষুধ নেওয়ার বিষয়টি নিশ্চিত করতে অনুগ্রহ করে আপনার ফোনে 1 টিপুন।",
-            "voice": "Google.bn-IN-Standard-A",
-            "language": "bn-IN"
-        },
-        "Malayalam": {
-            "greeting": "നമസ്കാരം, ഇത് ലാസ്റ്റ്മൈൽ മെഡ്സ് കോളാണ്.",
-            "prompt": f"നിങ്ങളുടെ മരുന്ന് {job.medicine.name} കഴിക്കാനുള്ള സമയമായി. ദയവായി {job.medicine.dosage} കഴിക്കുക. ഇത് {job.medicine.description} ആണ്.",
-            "action": "മരുന്ന് കഴിച്ചുവെന്ന് ഉറപ്പാക്കാൻ ദയവായി നിങ്ങളുടെ ഫോണിൽ 1 അമർത്തുക.",
-            "voice": "Google.ml-IN-Standard-A",
-            "language": "ml-IN"
-        }
-    }
-    
-    lang_info = language_greetings.get(job.elderly.language, language_greetings["English"])
-    greeting_text = job.elderly.greeting_audio_url if job.elderly.greeting_audio_url else lang_info["greeting"]
-
-    # Play Greeting & Instructions
+    # Play or speak greeting
     if job.elderly.greeting_audio_url and job.elderly.greeting_audio_url.startswith("http"):
         response.play(job.elderly.greeting_audio_url)
     else:
-        response.say(greeting_text, voice=lang_info["voice"], language=lang_info["language"])
-        
-    response.say(lang_info["prompt"], voice=lang_info["voice"], language=lang_info["language"])
+        response.say(lang_info["greeting"], voice=lang_info["voice"], language=lang_info["language"])
+
+    response.say(prompt, voice=lang_info["voice"], language=lang_info["language"])
 
     # Gather keypad digit 1
     gather = response.gather(
         num_digits=1,
         action=f"{BASE_URL}/api/twilio/gather-digits/{job.id}",
         method="POST",
-        timeout=10
+        timeout=10,
     )
     gather.say(lang_info["action"], voice=lang_info["voice"], language=lang_info["language"])
 
-    # Redirect to timeout callback if no keys are pressed
+    # Redirect to timeout callback if no key is pressed within gather timeout
     response.redirect(f"{BASE_URL}/api/twilio/timeout-callback/{job.id}", method="POST")
 
     return Response(content=str(response), media_type="application/xml")
 
-from fastapi import Response
 
 @app.post("/api/twilio/gather-digits/{job_id}")
-def gather_digits_callback(job_id: int, Digits: str = Form(None), db: Session = Depends(get_db)):
+def gather_digits_callback(
+    job_id: int,
+    Digits: str = Form(None),
+    CallSid: str = Form(None),
+    db: Session = Depends(get_db),
+):
     """
-    Processes key presses. If '1' is received, confirms medication.
+    Processes key presses from the patient.
+    '1' → confirmed; anything else → treated as no-confirmation.
     """
     job = db.query(ReminderJob).filter(ReminderJob.id == job_id).first()
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
 
     response = VoiceResponse()
-    
-    # Remove from simulator queue
-    global active_calls
-    active_calls = [c for c in active_calls if c["job_id"] != job_id]
+
+    # Remove from simulator active-calls feed
+    call_service.active_calls[:] = [c for c in call_service.active_calls if c["job_id"] != job_id]
 
     if Digits == "1":
-        job.status = "CONFIRMED"
-        log = CallLog(
-            reminder_job_id=job.id,
-            attempt_num=job.attempt_count,
-            status="ANSWERED",
-            confirmed=True,
-            details="Patient confirmed via Twilio keypad press 1."
-        )
-        db.add(log)
-        db.commit()
-
-        # Say thank you and hangup
-        thanks_speech = {
-            "English": "Thank you. Your medication confirmation has been logged. Have a wonderful day.",
-            "Hindi": "धन्यवाद। आपकी दवाई की पुष्टि दर्ज कर ली गई है। आपका दिन शुभ हो।",
-            "Kannada": "ಧನ್ಯವಾದಗಳು. ನಿಮ್ಮ ಔಷಧಿಯ ವಿವರಗಳನ್ನು ಯಶಸ್ವಿಯಾಗಿ ನಮೂದಿಸಲಾಗಿದೆ. ದಿನ ಶುಭವಾಗಿರಲಿ."
-        }
-        speech = thanks_speech.get(job.elderly.language, thanks_speech["English"])
-        response.say(speech)
+        lang_info = get_language_script(job.elderly.language)
+        response.say(lang_info["thanks"], voice=lang_info["voice"], language=lang_info["language"])
         response.hangup()
+        # Delegate confirmation to call_service state machine
+        call_service.process_call_outcome(job_id, "confirmed", call_sid=CallSid)
     else:
-        # Invalid input, trigger hangup retry logic
-        db.close()
-        process_no_answer_or_hangup(job_id, f"Invalid digits input: {Digits}")
-        response.say("Invalid input. Goodbye.")
+        response.say("We did not receive your confirmation. Goodbye.")
         response.hangup()
+        call_service.process_call_outcome(job_id, "no-answer", call_sid=CallSid)
 
     return Response(content=str(response), media_type="application/xml")
 
+
 @app.post("/api/twilio/timeout-callback/{job_id}")
-def twilio_timeout_callback(job_id: int):
+def twilio_timeout_callback(job_id: int, CallSid: str = Form(None)):
     """
-    Triggers retry logic if the call gets answered but patient does not press a key.
+    Fires when the patient answers but does not press any key within Gather timeout.
+    Treated as WAITING_CONFIRMATION (the scheduler will escalate after 15 min).
     """
-    process_no_answer_or_hangup(job_id, "Call was answered but confirmation timeout occurred.")
+    # Remove from simulator feed
+    call_service.active_calls[:] = [c for c in call_service.active_calls if c["job_id"] != job_id]
     response = VoiceResponse()
+    response.say("We did not receive your confirmation. We will try again shortly.")
     response.hangup()
     return Response(content=str(response), media_type="application/xml")
 
+
 @app.post("/api/twilio/status-callback/{job_id}")
-def twilio_status_callback(job_id: int, CallStatus: str = Form(None)):
+def twilio_status_callback(
+    job_id: int,
+    CallStatus: str = Form(None),
+    CallSid: str = Form(None),
+):
     """
-    Listens to Twilio Call status events (e.g. no-answer, busy, failed).
+    Listens to Twilio Call lifecycle events (no-answer, busy, failed, completed).
+    Only terminal failure states are forwarded to the state machine here;
+    'completed' after answered is handled by gather-digits / timeout-callback.
     """
-    if CallStatus in ["no-answer", "busy", "failed"]:
-        process_no_answer_or_hangup(job_id, f"Outbound call ended with status: {CallStatus}")
+    if CallStatus in ("no-answer", "busy", "failed"):
+        call_service.process_call_outcome(job_id, CallStatus, call_sid=CallSid)
     return {"status": "ok"}
 
 # --- Dashboard API ---
@@ -534,7 +470,8 @@ def add_medicine(elderly_id: int, med: MedicineCreate, db: Session = Depends(get
         frequency=med.frequency,
         time=med.time,
         duration=med.duration,
-        description=med.description
+        description=med.description,
+        medicine_cue=med.medicine_cue,  # optional caregiver recognition cue
     )
     db.add(db_med)
     db.commit()
@@ -553,17 +490,18 @@ def add_medicine(elderly_id: int, med: MedicineCreate, db: Session = Depends(get
         elderly_id=elderly_id,
         medicine_id=db_med.id,
         scheduled_time=scheduled_time,
-        status="PENDING"
+        status=CallStatus.PENDING,
     )
     db.add(job)
     db.commit()
 
     scheduler.add_job(
-        trigger_outbound_call,
-        'date',
+        call_service.trigger_outbound_call,
+        "date",
         run_date=scheduled_time,
         args=[job.id],
-        id=f"job_{job.id}"
+        id=f"job_{job.id}",
+        replace_existing=True,
     )
 
     return db_med
@@ -577,51 +515,66 @@ def force_trigger_reminder(job_id: int, db: Session = Depends(get_db)):
     job = db.query(ReminderJob).filter(ReminderJob.id == job_id).first()
     if not job:
         raise HTTPException(status_code=404, detail="Reminder not found")
-    trigger_outbound_call(job.id)
+    call_service.trigger_outbound_call(job.id)
     return {"message": "Outbound reminder call initiated."}
 
 # Active Calls for Simulator Panel
 @app.get("/api/simulator/calls")
 def get_simulated_calls():
-    return active_calls
+    return call_service.active_calls
+
 
 # Twilio Simulator Actions (Press 1 to confirm, Hangup, No Answer)
 @app.post("/api/simulator/calls/{job_id}/action")
 def simulator_call_action(job_id: int, action: str, db: Session = Depends(get_db)):
-    global active_calls
-    active_calls = [c for c in active_calls if c["job_id"] != job_id]
+    # Remove from active-calls feed
+    call_service.active_calls[:] = [c for c in call_service.active_calls if c["job_id"] != job_id]
 
     job = db.query(ReminderJob).filter(ReminderJob.id == job_id).first()
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
 
     if action == "CONFIRM":
-        job.status = "CONFIRMED"
-        log = CallLog(
-            reminder_job_id=job.id,
-            attempt_num=job.attempt_count,
-            status="ANSWERED",
-            confirmed=True,
-            details="Patient confirmed by pressing 1."
-        )
-        db.add(log)
-        db.commit()
+        call_service.process_call_outcome(job_id, "confirmed")
         return {"status": "success", "message": "Medication confirmation received."}
-    
+
     elif action == "HANGUP":
-        process_no_answer_or_hangup(job_id, "Patient answered but hung up without confirming.")
+        call_service.process_call_outcome(job_id, "no-answer")
         return {"status": "retry", "message": "Call hung up. Scheduling retry."}
-    
+
     elif action == "NO_ANSWER":
-        process_no_answer_or_hangup(job_id, "Call was not answered / timed out.")
+        call_service.process_call_outcome(job_id, "no-answer")
         return {"status": "retry", "message": "No answer. Scheduling retry."}
 
+    elif action == "BUSY":
+        call_service.process_call_outcome(job_id, "busy")
+        return {"status": "retry", "message": "Phone busy. Caregiver notified and retry scheduled."}
+
     raise HTTPException(status_code=400, detail="Invalid action")
+
 
 # Caregiver WhatsApp Simulator Alerts
 @app.get("/api/simulator/whatsapp")
 def get_whatsapp_alerts():
-    return whatsapp_alerts
+    return notifier.whatsapp_alerts
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Manual summary trigger endpoints
+# ─────────────────────────────────────────────────────────────────────────────
+
+@app.post("/api/notifications/daily-summary")
+def trigger_daily_summary(db: Session = Depends(get_db)):
+    """Manually trigger the daily medication adherence summary for all caregivers."""
+    notifier.send_daily_summary(db)
+    return {"message": "Daily summary sent to all caregivers."}
+
+
+@app.post("/api/notifications/weekly-summary")
+def trigger_weekly_summary(db: Session = Depends(get_db)):
+    """Manually trigger the weekly medication adherence summary for all caregivers."""
+    notifier.send_weekly_summary(db)
+    return {"message": "Weekly summary sent to all caregivers."}
 
 # Real Prescription OCR & AI Parsing Endpoint using Gemini API
 @app.post("/api/ocr-parser")
